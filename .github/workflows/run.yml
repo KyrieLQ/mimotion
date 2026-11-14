@@ -2,40 +2,114 @@ name: 刷步数
 
 on:
   schedule:
-    - cron: '45 14 * * *'
+    - cron: '7 22 * * *'
+      timezone: Asia/Shanghai
+    # GitHub 定时触发延迟数小时时的备用触发
+    - cron: '37 16 * * *'
+      timezone: Asia/Shanghai
   workflow_dispatch:
+
+concurrency:
+  group: mimotion-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 80
+    permissions:
+      actions: read
+      contents: read
     steps:
+      - name: 检查北京时间和当天提交记录
+        id: window
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          day=$(TZ=Asia/Shanghai date +%F)
+          opens=$(TZ=Asia/Shanghai date -d "$day 22:00" +%s)
+          closes=$(TZ=Asia/Shanghai date -d "$day 23:50" +%s)
+          deadline=$(TZ=Asia/Shanghai date -d "$day 23:57" +%s)
+          now=$(date +%s)
+          if (( now < opens - 3600 || now >= closes )); then
+            echo '当前时间不在晚间执行窗口，跳过。'
+            exit 0
+          fi
+          if (( now < opens )); then
+            sleep "$((opens - now))"
+          fi
+
+          since=$(date -u -d "@$opens" +%FT%TZ)
+          midnight=$(TZ=Asia/Shanghai date -d "$day 00:00" +%s)
+          from=$(date -u -d "@$midnight" +%FT%TZ)
+          runs=$(gh api --paginate --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/run.yml/runs" \
+            -f branch="$GITHUB_REF_NAME" -f created=">=$from" -f status=completed --jq '.workflow_runs[].id')
+          for run in $runs; do
+            submitted=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs?filter=all&per_page=100" \
+              --jq '.jobs[].steps[]? | select(.name == "开始" and .conclusion == "success") | .completed_at')
+            while IFS= read -r completed; do
+              if [[ "$completed" > "$since" || "$completed" == "$since" ]]; then
+                echo "今晚已有成功提交（运行 $run），跳过。"
+                exit 0
+              fi
+            done <<< "$submitted"
+          done
+          echo "deadline=$deadline" >> "$GITHUB_OUTPUT"
+
       - name: Checkout codes
+        if: github.event_name == 'workflow_dispatch' || steps.window.outputs.deadline != ''
         uses: actions/checkout@v5
         with:
           token: ${{ secrets.PAT }} #此处PAT需要申请，教程详见：README
+
       - name: Update system and install zsh
+        if: github.event_name == 'workflow_dispatch' || steps.window.outputs.deadline != ''
+        timeout-minutes: 7
         run: |
           sudo -E apt-get -qq update
           sudo -E apt-get install zsh -y
-          
+
       - name: 初始化Python
+        if: github.event_name == 'workflow_dispatch' || steps.window.outputs.deadline != ''
         uses: actions/setup-python@v6
         with:
           python-version: "3.10"
-          
+
       - name: 开始
+        id: submit
+        if: github.event_name == 'workflow_dispatch' || steps.window.outputs.deadline != ''
+        shell: bash
         env:
-            CONFIG: ${{ secrets.CONFIG }}
-            AES_KEY: ${{ secrets.AES_KEY }}
+          DEADLINE: ${{ steps.window.outputs.deadline }}
+          CONFIG: ${{ secrets.CONFIG }}
+          AES_KEY: ${{ secrets.AES_KEY }}
         run: |
-          pip3 install -r requirements.txt
-          python3 main.py
+          log=$(mktemp)
+          trap 'rm -f "$log"' EXIT
+          command=(bash -e -c 'pip3 install -r requirements.txt && python3 main.py')
+          if [[ -n "$DEADLINE" ]]; then
+            remaining=$((DEADLINE - $(date +%s)))
+            if (( remaining <= 0 )); then
+              echo '已超过当天提交截止时间。'
+              exit 1
+            fi
+            command=(timeout --signal=KILL "$remaining" "${command[@]}")
+          fi
+          "${command[@]}" | tee "$log"
+          echo 'finished=true' >> "$GITHUB_OUTPUT"
+          grep -Eq '^执行账号总数[1-9][0-9]*，成功：[1-9][0-9]*，失败：0[[:space:]]*$' "$log"
 
       - name: persist tokens
+        if: ${{ !cancelled() && steps.submit.outputs.finished == 'true' }}
+        timeout-minutes: 2
         run: |
           git config user.name github-actions
           git config user.email github-actions@users.noreply.github.com
           git add .
+          if git diff --cached --quiet; then
+            exit 0
+          fi
           git commit -m "persist tokens trigger by ${{ github.event_name }}"
           git push origin master
